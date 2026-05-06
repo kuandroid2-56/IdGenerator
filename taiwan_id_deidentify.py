@@ -1,27 +1,41 @@
 """
 De-identification tool for Taiwan-style ID numbers.
-Reads an Excel file produced by taiwan_id_generator.py, adds a
-去識別化身分證號碼 column (masking digits 4–7 with ****), and saves a new file.
+Reads an Excel file produced by taiwan_id_generator.py, appends a
+去識別化身分證號碼 column using HMAC-SHA256, and saves a new file.
 
-Usage: python3 taiwan_id_deidentify.py <input.xlsx> [output.xlsx]
+Why HMAC-SHA256 instead of simple masking:
+  - Masking (e.g. A12****789) causes collisions: up to 10,000 different original
+    IDs share the same masked value, breaking 1-to-1 correspondence.
+  - Plain SHA-256 is collision-free in practice but vulnerable to brute-force
+    because the Taiwan ID keyspace is finite (~520 million valid IDs).
+  - HMAC-SHA256 with a secret key makes brute-force computationally infeasible
+    without the key, while still guaranteeing a unique token per unique ID.
+
+Secret key handling:
+  - Pass via --key <secret> argument, or set env var DEIDENTIFY_KEY.
+  - If neither is provided a random key is generated, printed, and must be
+    stored to re-produce the same tokens later.
+
+Usage:
+  python3 taiwan_id_deidentify.py <input.xlsx> [output.xlsx] [--key <secret>]
 """
 
+import hashlib
+import hmac
+import os
+import secrets
 import sys
 from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font, Alignment, PatternFill
 
 
-def deidentify(id_str: str) -> str:
-    """
-    Mask positions 4–7 (0-indexed 3–6) of a Taiwan ID string.
-    Example: A123456789 -> A12****789
-    """
-    if len(id_str) != 10:
-        return id_str
-    return id_str[:3] + "****" + id_str[7:]
+def hmac_token(id_str: str, key: bytes) -> str:
+    """Return a 16-char uppercase hex HMAC-SHA256 token for id_str."""
+    digest = hmac.new(key, id_str.encode(), hashlib.sha256).hexdigest()
+    return digest[:16].upper()
 
 
-def process_excel(input_path: str, output_path: str) -> None:
+def process_excel(input_path: str, output_path: str, key: bytes) -> None:
     try:
         src = load_workbook(input_path)
     except FileNotFoundError:
@@ -41,7 +55,6 @@ def process_excel(input_path: str, output_path: str) -> None:
     header = list(rows[0])
     data = rows[1:]
 
-    # Locate the ID column
     id_col_index = None
     for i, col_name in enumerate(header):
         if col_name == "身分證號碼":
@@ -76,7 +89,7 @@ def process_excel(input_path: str, output_path: str) -> None:
     for row_idx, row in enumerate(data, start=2):
         is_alt = row_idx % 2 == 0
         id_value = row[id_col_index] if id_col_index < len(row) else ""
-        masked = deidentify(str(id_value)) if id_value else ""
+        token = hmac_token(str(id_value), key) if id_value else ""
 
         for col_idx, value in enumerate(row, start=1):
             cell = ws.cell(row=row_idx, column=col_idx, value=value)
@@ -85,7 +98,7 @@ def process_excel(input_path: str, output_path: str) -> None:
                 cell.fill = alt_fill
 
         new_col_idx = len(row) + 1
-        cell = ws.cell(row=row_idx, column=new_col_idx, value=masked)
+        cell = ws.cell(row=row_idx, column=new_col_idx, value=token)
         cell.alignment = center
         if is_alt:
             cell.fill = alt_new_fill
@@ -93,27 +106,54 @@ def process_excel(input_path: str, output_path: str) -> None:
     ws.freeze_panes = "A2"
     wb.save(output_path)
     print(f"完成：共處理 {len(data)} 筆，已儲存至 {output_path}")
-    print(f"去識別化規則：保留前 3 碼與後 3 碼，中間 4 碼遮蔽為 ****")
-    print(f"範例：A123456789  →  A12****789")
+    print(f"去識別化方式：HMAC-SHA256（取前 16 碼十六進位）")
+    print(f"範例：A123456789  →  3D9F2A... (唯一、不可逆)")
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("用法: python3 taiwan_id_deidentify.py <輸入檔案.xlsx> [輸出檔案.xlsx]")
-        print("例如: python3 taiwan_id_deidentify.py taiwan_ids.xlsx deidentified.xlsx")
+def parse_args() -> tuple[str, str, bytes]:
+    args = sys.argv[1:]
+    if not args:
+        print("用法: python3 taiwan_id_deidentify.py <輸入檔案.xlsx> [輸出檔案.xlsx] [--key <密鑰>]")
+        print("例如: python3 taiwan_id_deidentify.py taiwan_ids.xlsx deidentified.xlsx --key mysecret")
         sys.exit(1)
 
-    input_path = sys.argv[1]
-    if len(sys.argv) >= 3:
-        output_path = sys.argv[2]
-    else:
+    input_path = args[0]
+    output_path = None
+    key_str = None
+
+    i = 1
+    while i < len(args):
+        if args[i] == "--key" and i + 1 < len(args):
+            key_str = args[i + 1]
+            i += 2
+        elif output_path is None and not args[i].startswith("--"):
+            output_path = args[i]
+            i += 1
+        else:
+            i += 1
+
+    if output_path is None:
         base = input_path.removesuffix(".xlsx")
         output_path = f"{base}_deidentified.xlsx"
-
     if not output_path.endswith(".xlsx"):
         output_path += ".xlsx"
 
-    process_excel(input_path, output_path)
+    # Key priority: --key arg > env var > auto-generate
+    if key_str is None:
+        key_str = os.environ.get("DEIDENTIFY_KEY")
+    if key_str is None:
+        key_str = secrets.token_hex(32)
+        print(f"[警告] 未提供密鑰，本次自動產生：{key_str}")
+        print(f"       請保存此密鑰，日後需產生相同 token 時須使用相同密鑰。")
+    else:
+        print(f"[資訊] 使用指定密鑰進行 HMAC-SHA256 去識別化。")
+
+    return input_path, output_path, key_str.encode()
+
+
+def main():
+    input_path, output_path, key = parse_args()
+    process_excel(input_path, output_path, key)
 
 
 if __name__ == "__main__":
